@@ -4,7 +4,10 @@
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 
 using namespace llvm;
 
@@ -223,12 +226,75 @@ bool nanAlgebraicXopId(BasicBlock &BB)
   return changed;
 }
 
+bool nanEliminateCommonSubexpressions(BasicBlock &BB)
+{
+  bool changed = false;
+  //hash of (opcode, type, operands) -> earlier instructions with that hash, to be checked with isIdenticalTo
+  DenseMap<hash_code, SmallVector<Instruction *, 2>> ExprTable;
+  DenseMap<Value *, LoadInst *> LoadTable;//pointer -> last non-volatile load from it, valid until a store/call may clobber memory
+
+  for(Instruction &I : make_early_inc_range(BB)) {//iterate over all instructions in the block; I may be erased, so advance the iterator first
+    if(isa<CallInst>(&I) || isa<StoreInst>(&I)) {
+      LoadTable.clear();//no alias analysis here: conservatively forget every tracked load, it may have been clobbered
+      continue;
+    }
+
+    if(auto *LI = dyn_cast<LoadInst>(&I)) {
+      if(LI->isVolatile())
+        continue;
+
+      auto *Ptr = LI->getPointerOperand();
+      auto It = LoadTable.find(Ptr);
+      if(It != LoadTable.end() && It->second->getType() == LI->getType()) {//same pointer, same loaded type, nothing clobbered it since
+        errs() << "CSE: replacing redundant load " << *LI << " with earlier load " << *It->second << "\n";
+        LI->replaceAllUsesWith(It->second);//reuse the earlier loaded value
+        LI->eraseFromParent();//this reload is now dead, remove it from the block
+        changed = true;
+        continue;
+      }
+
+      LoadTable[Ptr] = LI;//first (or freshest) load from this pointer, remember it for later matches
+      continue;
+    }
+
+    //only pure, non-memory instructions are safe to CSE within a single block
+    if(I.isTerminator() || isa<PHINode>(&I) || isa<AllocaInst>(&I) ||
+       I.mayReadOrWriteMemory() || I.mayHaveSideEffects() || I.isEHPad())
+      continue;
+
+    auto H = hash_combine(I.getOpcode(), I.getType(), hash_combine_range(I.value_op_begin(), I.value_op_end()));
+
+    auto &Bucket = ExprTable[H];//candidate instructions that hash the same as I
+    Instruction *Match = nullptr;
+
+    for(Instruction *Earlier : Bucket) {
+      if(Earlier->isIdenticalTo(&I)) {//same opcode, operands, type and flags: a true common subexpression
+        Match = Earlier;
+        break;
+      }
+    }
+
+    if(Match) {
+      errs() << "CSE: replacing " << I << " with earlier identical " << *Match << "\n";
+      I.replaceAllUsesWith(Match);//reuse the earlier computed value
+      I.eraseFromParent();//this recomputation is now dead, remove it from the block
+      changed = true;
+      continue;
+    }
+
+    Bucket.push_back(&I);//first time we've seen this expression in the block, remember it for later matches
+  }
+
+  return changed;
+}
+
 bool nanPerformLocalOpt(BasicBlock &BB)
 {
   bool changed = false;
 
   errs() << "optimizing BB " << BB.getName() << " of function " << BB.getParent()->getName() << "\n";
 
+ changed ^= nanEliminateCommonSubexpressions(BB);//reuse earlier identical pure computations instead of recomputing them
  changed ^= nanAlgebraicXopId(BB);//due to side effect produced by PROGRAMMER with no change in program semantics.
  changed ^= nanConstantFold(BB);//fold binary ops whose operands are both constant ints
 //  changed ^= nanReduceStrength(BB); // "Reduce strength X* 4 --> shl x, 2 and  X/4 --> shr x, 2
@@ -252,7 +318,7 @@ PreservedAnalyses ReshiPass::run(Function &F,
                                       FunctionAnalysisManager &AM) {
   bool changed = false;
 
-  PromotePass().run(F, AM);//promote allocas to SSA registers (mem2reg) so identity checks can see repeated uses of the same value
+  // PromotePass().run(F, AM);//promote allocas to SSA registers (mem2reg) so identity checks can see repeated uses of the same value
 
   for(BasicBlock &BB : F) {//iterate over all basic blocks in the function
     dumpBasicBlock(BB, "BEFORE OPT");

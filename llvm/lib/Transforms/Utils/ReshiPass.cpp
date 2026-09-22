@@ -226,6 +226,53 @@ bool nanAlgebraicXopId(BasicBlock &BB)
   return changed;
 }
 
+bool nanPropagateAllocaConstants(BasicBlock &BB)
+{
+  bool changed = false;
+  DenseMap<Value *, Constant *> ConstVals;//pointer -> last known constant stored into it, valid until a store of a non-constant or a call may clobber it
+
+  for(Instruction &I : make_early_inc_range(BB)) {//iterate over all instructions in the block; I may be erased, so advance the iterator first
+    if(isa<CallInst>(&I)) {
+      ConstVals.clear();//a call may write through a pointer we can't see, forget everything we knew
+      continue;
+    }
+
+    if(auto *SI = dyn_cast<StoreInst>(&I)) {
+      auto *Ptr = SI->getPointerOperand();
+
+      if(SI->isVolatile()) {
+        ConstVals.erase(Ptr);
+        continue;
+      }
+
+      if(auto *C = dyn_cast<Constant>(SI->getValueOperand())) {
+        errs() << "Tracking constant store " << *SI << "\n";
+        ConstVals[Ptr] = C;//record the newly stored constant
+      } else {
+        ConstVals.erase(Ptr);//value stored is not a compile-time constant, forget what we knew
+      }
+      continue;
+    }
+
+    if(auto *LI = dyn_cast<LoadInst>(&I)) {
+      if(LI->isVolatile())
+        continue;
+
+      auto *Ptr = LI->getPointerOperand();
+      auto It = ConstVals.find(Ptr);
+      if(It == ConstVals.end() || It->second->getType() != LI->getType())
+        continue;
+
+      errs() << "Replacing load " << *LI << " with constant " << *It->second << "\n";
+      LI->replaceAllUsesWith(It->second);//replace the load with the known constant
+      LI->eraseFromParent();//load is now dead, remove it from the block
+      changed = true;
+    }
+  }
+
+  return changed;
+}
+
 bool nanEliminateCommonSubexpressions(BasicBlock &BB)
 {
   bool changed = false;
@@ -294,10 +341,19 @@ bool nanPerformLocalOpt(BasicBlock &BB)
 
   errs() << "optimizing BB " << BB.getName() << " of function " << BB.getParent()->getName() << "\n";
 
- changed ^= nanEliminateCommonSubexpressions(BB);//reuse earlier identical pure computations instead of recomputing them
- changed ^= nanAlgebraicXopId(BB);//due to side effect produced by PROGRAMMER with no change in program semantics.
- changed ^= nanConstantFold(BB);//fold binary ops whose operands are both constant ints
-//  changed ^= nanReduceStrength(BB); // "Reduce strength X* 4 --> shl x, 2 and  X/4 --> shr x, 2
+  //each sub-optimization can expose new opportunities for the others (e.g. an algebraic
+  //identity turning a store's value into a constant lets propagation see it), so iterate
+  //this local pipeline to a fixpoint instead of running each piece just once
+  bool localChanged;
+  do {
+    localChanged = false;
+    localChanged |= nanPropagateAllocaConstants(BB);//propagate constants stored into pointers to their later loads
+    localChanged |= nanEliminateCommonSubexpressions(BB);//reuse earlier identical pure computations instead of recomputing them
+    localChanged |= nanAlgebraicXopId(BB);//due to side effect produced by PROGRAMMER with no change in program semantics.
+    localChanged |= nanConstantFold(BB);//fold binary ops whose operands are both constant ints
+    changed |= localChanged;
+  } while(localChanged);
+
   return changed;
 }
 

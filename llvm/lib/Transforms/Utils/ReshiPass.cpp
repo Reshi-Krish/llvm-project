@@ -7,7 +7,9 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/CFG.h"
 
 using namespace llvm;
 
@@ -357,6 +359,115 @@ bool nanPerformLocalOpt(BasicBlock &BB)
   return changed;
 }
 
+bool nanEliminateDeadCode(Function &F)
+{
+  bool changed = false;
+
+  // Section 1: remove blocks that can never be reached from the entry block.
+  {
+    SmallPtrSet<BasicBlock *, 8> Reachable;
+    SmallVector<BasicBlock *, 8> Worklist;
+    Reachable.insert(&F.getEntryBlock());
+    Worklist.push_back(&F.getEntryBlock());
+
+    while(!Worklist.empty()) {
+      auto *BB = Worklist.pop_back_val();
+      for(auto *Succ : successors(BB)) {
+        if(Reachable.insert(Succ).second)//first time reaching this successor
+          Worklist.push_back(Succ);
+      }
+    }
+
+    for(BasicBlock &BB : make_early_inc_range(F)) {
+      if(Reachable.count(&BB))
+        continue;
+
+      errs() << "Removing unreachable block " << BB.getName() << "\n";
+      BB.dropAllReferences();//drop uses first, so other dead blocks referring to this one can still be erased safely
+      changed = true;
+    }
+
+    for(BasicBlock &BB : make_early_inc_range(F)) {
+      if(!Reachable.count(&BB))
+        BB.eraseFromParent();
+    }
+  }
+
+  // Section 2: within each remaining block, remove dead results and dead (overwritten-or-never-read) stores.
+  // This has to run to a fixpoint: removing a dead load can make its address's store dead, and
+  // removing a dead store can make the pointer's now-sole-use alloca dead in turn.
+  bool sectionChanged;
+  do {
+    sectionChanged = false;
+
+    for(BasicBlock &BB : F) {
+      DenseMap<Value *, StoreInst *> LastStore;//pointer -> most recent store to it that hasn't been read since
+
+      for(Instruction &I : make_early_inc_range(BB)) {//iterate over all instructions in the block; I may be erased, so advance the iterator first
+        if(isa<CallInst>(&I)) {
+          LastStore.clear();//a call may read through a pointer we can't see, its prior store might be observed
+          continue;
+        }
+
+        if(auto *LI = dyn_cast<LoadInst>(&I)) {
+          if(LI->use_empty() && !LI->isVolatile()) {
+            errs() << "Removing dead load " << *LI << ", it has no uses\n";
+            LI->eraseFromParent();//loaded value is never used, e.g. the computation using it folded away to a constant
+            sectionChanged = true;
+            continue;
+          }
+
+          LastStore.erase(LI->getPointerOperand());//this pointer has now been read, its last store is no longer dead
+          continue;
+        }
+
+        if(auto *SI = dyn_cast<StoreInst>(&I)) {
+          auto *Ptr = SI->getPointerOperand();
+          auto It = LastStore.find(Ptr);
+          if(It != LastStore.end() && !It->second->isVolatile() && !SI->isVolatile()) {
+            errs() << "Removing dead store " << *It->second << ", overwritten before being read\n";
+            It->second->eraseFromParent();//nothing read this value before it was overwritten
+            sectionChanged = true;
+          }
+
+          LastStore[Ptr] = SI;//track this store as the newest write to the pointer
+          continue;
+        }
+
+        if(I.isTerminator() || isa<PHINode>(&I) || I.mayHaveSideEffects())
+          continue;
+
+        if(I.use_empty()) {
+          errs() << "Removing dead result " << I << ", it has no uses\n";
+          I.eraseFromParent();//pure computation whose result is never used
+          sectionChanged = true;
+        }
+      }
+
+      // A store still pending here was never read before the block returns, so if it's writing to a
+      // local alloca that isn't used anywhere else, the value is never observed: the store is dead.
+      if(isa<ReturnInst>(BB.getTerminator())) {
+        for(auto &Entry : LastStore) {
+          auto *AI = dyn_cast<AllocaInst>(Entry.first);
+          if(!AI || Entry.second->isVolatile())
+            continue;
+
+          if(!all_of(AI->users(), [&](User *U) { return U == Entry.second || isa<LoadInst>(U); }))
+            continue;//alloca escapes (e.g. passed to a call) or is used some other way we can't reason about here
+
+          errs() << "Removing dead store " << *Entry.second << ", value is never read before the function returns\n";
+          Entry.second->eraseFromParent();
+          sectionChanged = true;
+        }
+      }
+    }
+
+    changed |= sectionChanged;
+  } while(sectionChanged);
+
+  return changed;
+}
+
 void dumpBasicBlock(BasicBlock &BB, const char *title)
 {
   errs() << "=== " << title << " ===" << "\n";
@@ -380,6 +491,12 @@ PreservedAnalyses ReshiPass::run(Function &F,
     dumpBasicBlock(BB, "BEFORE OPT");
     nanPerformLocalOpt(BB);//Optimization local to basic block: XopID and strength reduction.
     dumpBasicBlock(BB, "AFTER  OPT");
+  }
+
+  nanEliminateDeadCode(F);//remove unreachable blocks, then dead results and dead stores left behind by the above
+
+  for(BasicBlock &BB : F) {//blocks may have been removed above, so re-iterate what's left
+    dumpBasicBlock(BB, "AFTER  DCE");
   }
 
   return PreservedAnalyses::all();

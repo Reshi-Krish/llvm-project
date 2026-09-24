@@ -3,7 +3,7 @@
 
 int main(){
 	int b=4, c,d,e;	
-	c=d;//copy propagation	
+	c=b;//copy propagation	
 	e = c+b; 
 	return e;
 }

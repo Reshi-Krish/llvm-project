@@ -15,189 +15,202 @@ using namespace llvm;
 
 namespace {
 
+// Simplifies a single binary operator using algebraic identities, e.g.
+// x - x = 0, x * 1 = x, x + 0 = x, C * x = x << log2(C). Handles both the
+// "same operand twice" case and the "one operand is a constant" case
+// (checking the constant on either side, since Sub/Div aren't commutative).
+// Returns true and erases BI if a simplification applied.
 bool nanAlgebricXopIdInternal(BinaryOperator *BI)
 {
-      auto op1 = BI->getOperand(0);//first operand
-      auto op2 = BI->getOperand(1);//second operand
+  auto op1 = BI->getOperand(0);//first operand
+  auto op2 = BI->getOperand(1);//second operand
 
-      Value *finalci = NULL;//initialize to NULL
+  Value *finalci = NULL;//initialize to NULL
 
-      if(op1 == op2) {//both operands are the same value
-        switch(BI->getOpcode()) {//check op code of the operator
-        default:
-          break;
-        case Instruction::Add: {
-          //          errs() << "applying x + x = x << 1 for : " << BI << "\n";
-          auto shift = ConstantInt::get(op1->getType(), 1);//shift left by 1
-          finalci = BinaryOperator::CreateShl(op1, shift, "", BI->getIterator());
-          break;
-        }
-        case Instruction::Sub:
-          //          errs() << "applying x - x = 0 for : " << BI << "\n";
-          finalci = ConstantInt::get(op1->getType(), 0);
-          break;
-        case Instruction::SDiv:
-        case Instruction::UDiv:
-          //          errs() << "applying x / x = 1 for : " << BI << "\n";
-          finalci = ConstantInt::get(op1->getType(), 1);
-          break;
-        }
+  if(op1 == op2) {//both operands are the same value
+    switch(BI->getOpcode()) {//check op code of the operator
+    default:
+      break;
+    case Instruction::Add: {
+      errs() << "applying x + x = x << 1 for : " << *BI << "\n";
+      auto shift = ConstantInt::get(op1->getType(), 1);//shift left by 1
+      finalci = BinaryOperator::CreateShl(op1, shift, "", BI->getIterator());
+      break;
+    }
+    case Instruction::Sub:
+      errs() << "applying x - x = 0 for : " << *BI << "\n";
+      finalci = ConstantInt::get(op1->getType(), 0);
+      break;
+    case Instruction::SDiv:
+    case Instruction::UDiv:
+      errs() << "applying x / x = 1 for : " << *BI << "\n";
+      finalci = ConstantInt::get(op1->getType(), 1);
+      break;
+    }
 
-        if(finalci) {//if not NULL
-          errs()<<"Replacing all uses of " << *BI<<" with its identity value\n";
-          auto V = dyn_cast<Instruction>(BI);
-          assert(V && V->hasNUsesOrMore(1));
-          V->replaceAllUsesWith(finalci);//replace all uses of BI with the computed identity value
-          V->eraseFromParent();//BI is now dead, remove it from the block
-          return true;
-        }
-
-        return false;
-      }
-
-      auto op2c = dyn_cast<Constant>(op2);//typecase second operand to constant
-      auto op1c = dyn_cast<Constant>(op1);//typecast first operand to constant, for the commutative (Add/Mul) case
-
-      if(!op2c && !op1c)
-        return false;
-
-      if(op2c) {
-      switch(BI->getOpcode()) {//check op code of the operator
-      default:
-        break;
-      case Instruction::Add:
-      case Instruction::Sub:
-        if(op2c->isNullValue()) {//if value of constant is NULL/Zero
-//          errs() << "applying x +- ID = x for : " << BI << "\n";
-          finalci = op1;//operand one
-        }
-
-        break;
-      case Instruction::Mul: {
-        auto op2ci = dyn_cast<ConstantInt>(op2c);//power-of-2 check lives on ConstantInt's APInt, not Constant
-        if(op2ci && op2ci->getValue().isOne()) {//if value of constant is One
-//          errs() << "applying x * ID = x for : " << BI << "\n";
-          finalci = op1;//operand one
-        } else if(op2ci && op2ci->getValue().isPowerOf2()) {//if value of constant is power of 2
-//          errs() << "applying x * ID = x for : " << BI << "\n";
-          auto shift = ConstantInt::get(op2ci->getType(), op2ci->getValue().countTrailingZeros());//get the count of trailing zeros
-          finalci = BinaryOperator::CreateShl(op1, shift, "", BI->getIterator());//operand 1 shifted left by the count of trailing zeros
-        }
-        break;
-      }
-      case Instruction::SDiv:
-      case Instruction::UDiv:
-        if(op2c->isOneValue()) {//if value of constant is One
-  //        errs() << "applying x */ ID = x for : " << BI << "\n";
-          finalci = op1;//operand one
-        }
-
-        break;
-      }
-      }
-
-      if(!finalci && op1c) {
-        //op1 is (also) a constant, e.g. op2c matched Constant but wasn't a usable ConstantInt (undef); Sub/Div aren't commutative so only Add/Mul have a free identity here
-        switch(BI->getOpcode()) {
-        default:
-          break;
-        case Instruction::Add:
-          if(op1c->isNullValue()) {//ID + x = x
-//            errs() << "applying ID + x = x for : " << BI << "\n";
-            finalci = op2;//operand two
-          }
-          break;
-        case Instruction::Sub:
-          if(op1c->isNullValue()) {//0 - x = -x
-//            errs() << "applying 0 - x = -x for : " << BI << "\n";
-            finalci = BinaryOperator::CreateNeg(op2, "", BI->getIterator());//negate operand two
-          }
-          break;
-        case Instruction::Mul: {
-          auto op1ci = dyn_cast<ConstantInt>(op1c);
-          if(op1ci && op1ci->getValue().isOne()) {//ID * x = x
-//            errs() << "applying ID * x = x for : " << BI << "\n";
-            finalci = op2;//operand two
-          } else if(op1ci && op1ci->getValue().isPowerOf2()) {//C * x = x << log2(C)
-//            errs() << "applying C * x = x << shift for : " << BI << "\n";
-            auto shift = ConstantInt::get(op1ci->getType(), op1ci->getValue().countTrailingZeros());
-            finalci = BinaryOperator::CreateShl(op2, shift, "", BI->getIterator());//operand 2 shifted left by the count of trailing zeros
-          }
-          break;
-        }
-        }
-      }
-
-      if(finalci) {//if not NULL
-        errs()<<"Replacing all uses of " << *BI<<" with its first operand\n";
-        auto V = dyn_cast<Instruction>(BI);
-        assert(V && V->hasNUsesOrMore(1));
-//      errs()<<"Replacing all uses with"<< V<<"\n";
-        V->replaceAllUsesWith(finalci);//replace all used of BI with its operand one
-        V->eraseFromParent();//BI is now dead, remove it from the block
-        return true;
-      }
-
-      return false;
-}
-
-bool nanConstantFoldInternal(BinaryOperator *BI)
-{
-      auto op1c = dyn_cast<ConstantInt>(BI->getOperand(0));//typecast first operand to constant int
-      auto op2c = dyn_cast<ConstantInt>(BI->getOperand(1));//typecast second operand to constant int
-
-      if(!op1c || !op2c)//both operands must be constant ints to fold
-        return false;
-
-      auto &lhs = op1c->getValue();//APInt value of operand one
-      auto &rhs = op2c->getValue();//APInt value of operand two
-
-      APInt result;//holds the folded result
-
-      switch(BI->getOpcode()) {//check op code of the operator
-      default:
-        return false;//opcode not handled for constant folding
-      case Instruction::Add:
-        result = lhs + rhs;
-        break;
-      case Instruction::Sub:
-        result = lhs - rhs;
-        break;
-      case Instruction::Mul:
-        result = lhs * rhs;
-        break;
-      case Instruction::SDiv:
-        if(rhs.isZero())//division by zero is undefined, do not fold
-          return false;
-        result = lhs.sdiv(rhs);
-        break;
-      case Instruction::UDiv:
-        if(rhs.isZero())//division by zero is undefined, do not fold
-          return false;
-        result = lhs.udiv(rhs);
-        break;
-      case Instruction::And:
-        result = lhs & rhs;
-        break;
-      case Instruction::Or:
-        result = lhs | rhs;
-        break;
-      case Instruction::Xor:
-        result = lhs ^ rhs;
-        break;
-      }
-
-      auto finalci = ConstantInt::get(BI->getType(), result);//build the constant for the folded result
-
-      errs()<<"Constant folding " << *BI << " into " << *finalci << "\n";
+    if(finalci) {//if not NULL
+      errs() << "Replacing all uses of " << *BI << " with its identity value\n";
       auto V = dyn_cast<Instruction>(BI);
       assert(V && V->hasNUsesOrMore(1));
-      V->replaceAllUsesWith(finalci);//replace all uses of BI with the folded constant
+      V->replaceAllUsesWith(finalci);//replace all uses of BI with the computed identity value
       V->eraseFromParent();//BI is now dead, remove it from the block
-
       return true;
+    }
+
+    return false;
+  }
+
+  auto op2c = dyn_cast<Constant>(op2);//typecast second operand to constant
+  auto op1c = dyn_cast<Constant>(op1);//typecast first operand to constant, for the commutative (Add/Mul) case
+
+  if(!op2c && !op1c)
+    return false;
+
+  if(op2c) {
+    switch(BI->getOpcode()) {//check op code of the operator
+    default:
+      break;
+    case Instruction::Add:
+    case Instruction::Sub:
+      if(op2c->isNullValue()) {//if value of constant is NULL/Zero
+        errs() << "applying x +- ID = x for : " << *BI << "\n";
+        finalci = op1;//operand one
+      }
+
+      break;
+    case Instruction::Mul: {
+      auto op2ci = dyn_cast<ConstantInt>(op2c);//power-of-2 check lives on ConstantInt's APInt, not Constant
+      if(op2ci && op2ci->getValue().isOne()) {//if value of constant is One
+        errs() << "applying x * 1 = x for : " << *BI << "\n";
+        finalci = op1;//operand one
+      } else if(op2ci && op2ci->getValue().isPowerOf2()) {//if value of constant is power of 2
+        errs() << "applying x * C = x << shift for : " << *BI << "\n";
+        auto shift = ConstantInt::get(op2ci->getType(), op2ci->getValue().countTrailingZeros());//get the count of trailing zeros
+        finalci = BinaryOperator::CreateShl(op1, shift, "", BI->getIterator());//operand 1 shifted left by the count of trailing zeros
+      }
+      break;
+    }
+    case Instruction::SDiv:
+    case Instruction::UDiv:
+      if(op2c->isOneValue()) {//if value of constant is One
+        errs() << "applying x */ ID = x for : " << *BI << "\n";
+        finalci = op1;//operand one
+      }
+
+      break;
+    }
+  }
+
+  if(!finalci && op1c) {
+    //op1 is (also) a constant, e.g. op2c matched Constant but wasn't a usable ConstantInt (undef); Sub/Div aren't commutative so only Add/Mul have a free identity here
+    switch(BI->getOpcode()) {
+    default:
+      break;
+    case Instruction::Add:
+      if(op1c->isNullValue()) {//ID + x = x
+        errs() << "applying ID + x = x for : " << *BI << "\n";
+        finalci = op2;//operand two
+      }
+      break;
+    case Instruction::Sub:
+      if(op1c->isNullValue()) {//0 - x = -x
+        errs() << "applying 0 - x = -x for : " << *BI << "\n";
+        finalci = BinaryOperator::CreateNeg(op2, "", BI->getIterator());//negate operand two
+      }
+      break;
+    case Instruction::Mul: {
+      auto op1ci = dyn_cast<ConstantInt>(op1c);
+      if(op1ci && op1ci->getValue().isOne()) {//ID * x = x
+        errs() << "applying ID * x = x for : " << *BI << "\n";
+        finalci = op2;//operand two
+      } else if(op1ci && op1ci->getValue().isPowerOf2()) {//C * x = x << log2(C)
+        errs() << "applying C * x = x << shift for : " << *BI << "\n";
+        auto shift = ConstantInt::get(op1ci->getType(), op1ci->getValue().countTrailingZeros());
+        finalci = BinaryOperator::CreateShl(op2, shift, "", BI->getIterator());//operand 2 shifted left by the count of trailing zeros
+      }
+      break;
+    }
+    }
+  }
+
+  if(finalci) {//if not NULL
+    errs() << "Replacing all uses of " << *BI << " with its first operand\n";
+    auto V = dyn_cast<Instruction>(BI);
+    assert(V && V->hasNUsesOrMore(1));
+    V->replaceAllUsesWith(finalci);//replace all used of BI with its operand one
+    V->eraseFromParent();//BI is now dead, remove it from the block
+    return true;
+  }
+
+  return false;
 }
 
+// Folds a single binary operator whose operands are both compile-time
+// constant integers (e.g. add/sub/mul/div/and/or/xor of two ConstantInts)
+// into the resulting ConstantInt. Returns true and erases BI if folded.
+bool nanConstantFoldInternal(BinaryOperator *BI)
+{
+  auto op1c = dyn_cast<ConstantInt>(BI->getOperand(0));//typecast first operand to constant int
+  auto op2c = dyn_cast<ConstantInt>(BI->getOperand(1));//typecast second operand to constant int
+
+  if(!op1c || !op2c)//both operands must be constant ints to fold
+    return false;
+
+  auto &lhs = op1c->getValue();//APInt value of operand one
+  auto &rhs = op2c->getValue();//APInt value of operand two
+
+  APInt result;//holds the folded result
+
+  switch(BI->getOpcode()) {//check op code of the operator
+  default:
+    return false;//opcode not handled for constant folding
+  case Instruction::Add:
+    result = lhs + rhs;
+    break;
+  case Instruction::Sub:
+    result = lhs - rhs;
+    break;
+  case Instruction::Mul:
+    result = lhs * rhs;
+    break;
+  case Instruction::SDiv:
+    if(rhs.isZero())//division by zero is undefined, do not fold
+      return false;
+    result = lhs.sdiv(rhs);
+    break;
+  case Instruction::UDiv:
+    if(rhs.isZero())//division by zero is undefined, do not fold
+      return false;
+    result = lhs.udiv(rhs);
+    break;
+  case Instruction::Shl:
+    if(rhs.uge(lhs.getBitWidth()))//shifting by >= the bit width is undefined, do not fold
+      return false;
+    result = lhs.shl(rhs);
+    break;
+  case Instruction::And:
+    result = lhs & rhs;
+    break;
+  case Instruction::Or:
+    result = lhs | rhs;
+    break;
+  case Instruction::Xor:
+    result = lhs ^ rhs;
+    break;
+  }
+
+  auto finalci = ConstantInt::get(BI->getType(), result);//build the constant for the folded result
+
+  errs() << "Constant folding " << *BI << " into " << *finalci << "\n";
+  auto V = dyn_cast<Instruction>(BI);
+  assert(V && V->hasNUsesOrMore(1));
+  V->replaceAllUsesWith(finalci);//replace all uses of BI with the folded constant
+  V->eraseFromParent();//BI is now dead, remove it from the block
+
+  return true;
+}
+
+// Runs nanConstantFoldInternal over every binary operator in the block.
 bool nanConstantFold(BasicBlock &BB)
 {
   bool changed = false;
@@ -213,6 +226,7 @@ bool nanConstantFold(BasicBlock &BB)
   return changed;
 }
 
+// Runs nanAlgebricXopIdInternal over every binary operator in the block.
 bool nanAlgebraicXopId(BasicBlock &BB)
 {
   bool changed = false;
@@ -228,6 +242,12 @@ bool nanAlgebraicXopId(BasicBlock &BB)
   return changed;
 }
 
+// Local constant propagation: tracks the last constant value stored into
+// each pointer with a simple hashtable (pointer -> Constant*) and replaces
+// a later load from the same pointer with that constant. The tracked value
+// is invalidated by a store of a non-constant to the same pointer, a
+// volatile store/load, or any call (which may write through a pointer we
+// can't see).
 bool nanPropagateAllocaConstants(BasicBlock &BB)
 {
   bool changed = false;
@@ -235,6 +255,8 @@ bool nanPropagateAllocaConstants(BasicBlock &BB)
 
   for(Instruction &I : make_early_inc_range(BB)) {//iterate over all instructions in the block; I may be erased, so advance the iterator first
     if(isa<CallInst>(&I)) {
+      if(!ConstVals.empty())
+        errs() << "Call " << I << " may write through an escaped pointer, forgetting all tracked constants\n";
       ConstVals.clear();//a call may write through a pointer we can't see, forget everything we knew
       continue;
     }
@@ -243,6 +265,7 @@ bool nanPropagateAllocaConstants(BasicBlock &BB)
       auto *Ptr = SI->getPointerOperand();
 
       if(SI->isVolatile()) {
+        errs() << "Volatile store " << *SI << ", forgetting any tracked constant for this pointer\n";
         ConstVals.erase(Ptr);
         continue;
       }
@@ -251,6 +274,7 @@ bool nanPropagateAllocaConstants(BasicBlock &BB)
         errs() << "Tracking constant store " << *SI << "\n";
         ConstVals[Ptr] = C;//record the newly stored constant
       } else {
+        errs() << "Store " << *SI << " is not a constant, forgetting any tracked constant for this pointer\n";
         ConstVals.erase(Ptr);//value stored is not a compile-time constant, forget what we knew
       }
       continue;
@@ -275,6 +299,15 @@ bool nanPropagateAllocaConstants(BasicBlock &BB)
   return changed;
 }
 
+// Local common subexpression elimination for a single block. Two hashtables
+// drive it:
+//  - ExprTable hashes pure, memory-free instructions by (opcode, type,
+//    operands); a later instruction with the same hash is checked against
+//    each candidate with isIdenticalTo, and reuses the earliest match.
+//  - LoadTable tracks the last non-volatile load from each pointer, so a
+//    later load from the same pointer can reuse it (redundant load
+//    elimination); it's invalidated by any store or call, since there's no
+//    alias analysis here to prove they don't clobber the tracked address.
 bool nanEliminateCommonSubexpressions(BasicBlock &BB)
 {
   bool changed = false;
@@ -284,6 +317,8 @@ bool nanEliminateCommonSubexpressions(BasicBlock &BB)
 
   for(Instruction &I : make_early_inc_range(BB)) {//iterate over all instructions in the block; I may be erased, so advance the iterator first
     if(isa<CallInst>(&I) || isa<StoreInst>(&I)) {
+      if(!LoadTable.empty())
+        errs() << I << " may clobber memory, forgetting all tracked loads\n";
       LoadTable.clear();//no alias analysis here: conservatively forget every tracked load, it may have been clobbered
       continue;
     }
@@ -337,15 +372,16 @@ bool nanEliminateCommonSubexpressions(BasicBlock &BB)
   return changed;
 }
 
+// Runs the local (single-block) optimizations to a fixpoint: each sub-
+// optimization can expose new opportunities for the others (e.g. an
+// algebraic identity turning a store's value into a constant lets
+// propagation see it), so running each piece just once wouldn't be enough.
 bool nanPerformLocalOpt(BasicBlock &BB)
 {
   bool changed = false;
 
   errs() << "optimizing BB " << BB.getName() << " of function " << BB.getParent()->getName() << "\n";
 
-  //each sub-optimization can expose new opportunities for the others (e.g. an algebraic
-  //identity turning a store's value into a constant lets propagation see it), so iterate
-  //this local pipeline to a fixpoint instead of running each piece just once
   bool localChanged;
   do {
     localChanged = false;
@@ -359,6 +395,22 @@ bool nanPerformLocalOpt(BasicBlock &BB)
   return changed;
 }
 
+// Dead code elimination for the whole function, in two sections:
+//  1. Unreachable code: a worklist walk of successors() from the entry
+//     block finds every reachable block; anything else can never execute
+//     and is dropped.
+//  2. Unused stores and results: within each remaining block, a hashtable
+//     (pointer -> most recent unread StoreInst) tracks stores that haven't
+//     been observed yet. A load clears its pointer's entry (the store was
+//     read); a call conservatively clears the whole table; a new store to a
+//     pointer that still has a pending, unread store means that earlier
+//     store was dead (overwritten before being read) and gets erased. Pure,
+//     side-effect-free instructions (including loads) with no uses are also
+//     erased as dead results. Finally, a store still pending when a block
+//     returns was never read at all: if it targets a local alloca that
+//     isn't used any other way, that store is dead too.
+// Runs to a fixpoint, since removing a dead load can make its address's
+// store dead, and removing a dead store can in turn make its alloca dead.
 bool nanEliminateDeadCode(Function &F)
 {
   bool changed = false;
@@ -394,8 +446,6 @@ bool nanEliminateDeadCode(Function &F)
   }
 
   // Section 2: within each remaining block, remove dead results and dead (overwritten-or-never-read) stores.
-  // This has to run to a fixpoint: removing a dead load can make its address's store dead, and
-  // removing a dead store can make the pointer's now-sole-use alloca dead in turn.
   bool sectionChanged;
   do {
     sectionChanged = false;
@@ -468,6 +518,7 @@ bool nanEliminateDeadCode(Function &F)
   return changed;
 }
 
+// Debug helper: dumps every instruction in a block under a labeled header.
 void dumpBasicBlock(BasicBlock &BB, const char *title)
 {
   errs() << "=== " << title << " ===" << "\n";
@@ -481,11 +532,10 @@ void dumpBasicBlock(BasicBlock &BB, const char *title)
 
 } // namespace
 
+// Entry point: runs the local per-block optimizations to a fixpoint on every
+// block, then a whole-function dead code elimination pass over the result.
 PreservedAnalyses ReshiPass::run(Function &F,
                                       FunctionAnalysisManager &AM) {
-  bool changed = false;
-
-  // PromotePass().run(F, AM);//promote allocas to SSA registers (mem2reg) so identity checks can see repeated uses of the same value
 
   for(BasicBlock &BB : F) {//iterate over all basic blocks in the function
     dumpBasicBlock(BB, "BEFORE OPT");
